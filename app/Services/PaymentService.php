@@ -12,10 +12,10 @@ use InvalidArgumentException;
 class PaymentService
 {
     /**
-     * Mencatat permintaan pembayaran DP atau penuh.
+     * Membuat transaksi DP, pembayaran penuh, atau pelunasan.
      *
-     * Pembayaran tetap pending sampai diverifikasi
-     * oleh proses tepercaya.
+     * DP wajib 30% dari total booking.
+     * Pelunasan wajib sama dengan sisa tagihan.
      */
     public function createPayment(
         int $bookingId,
@@ -23,9 +23,13 @@ class PaymentService
         int $amount,
         string $method = 'other'
     ): Payment {
-        if (!in_array($type, ['dp', 'full_payment'], true)) {
+        if (!in_array($type, [
+            'dp',
+            'full_payment',
+            'remaining_payment',
+        ], true)) {
             throw new InvalidArgumentException(
-                'Jenis pembayaran harus DP atau pembayaran penuh.'
+                'Jenis pembayaran tidak valid.'
             );
         }
 
@@ -58,45 +62,26 @@ class PaymentService
                 ->lockForUpdate()
                 ->firstOrFail();
 
-            if ($booking->status !== 'pending_payment') {
-                throw ValidationException::withMessages([
-                    'payment' => 'Booking ini tidak sedang menunggu pembayaran.',
-                ]);
+            $total = (int) $booking->total_amount;
+
+            if ($total < 1) {
+                throw new InvalidArgumentException(
+                    'Total booking tidak valid.'
+                );
             }
 
+            // Hold hanya berlaku untuk pembayaran awal.
+            // Pelunasan dilakukan setelah DP, termasuk saat check-in.
             if (
-                $booking->hold_expires_at === null
-                || $booking->hold_expires_at->isPast()
+                in_array($type, ['dp', 'full_payment'], true)
+                && (
+                    $booking->hold_expires_at === null
+                    || !$booking->hold_expires_at->isFuture()
+                )
             ) {
                 throw ValidationException::withMessages([
                     'payment' => 'Waktu pembayaran telah berakhir.',
                 ]);
-            }
-
-            if ($booking->payment_status !== 'unpaid') {
-                throw ValidationException::withMessages([
-                    'payment' => 'Booking ini sudah memiliki pembayaran.',
-                ]);
-            }
-
-            $total = (int) $booking->total_amount;
-
-            if ($total < 1 || $amount > $total) {
-                throw new InvalidArgumentException(
-                    'Nominal pembayaran melebihi total tagihan atau total tidak valid.'
-                );
-            }
-
-            if ($type === 'full_payment' && $amount !== $total) {
-                throw new InvalidArgumentException(
-                    'Pembayaran penuh harus sama dengan total tagihan.'
-                );
-            }
-
-            if ($type === 'dp' && $amount >= $total) {
-                throw new InvalidArgumentException(
-                    'Nominal DP harus lebih kecil dari total tagihan.'
-                );
             }
 
             $hasPendingPayment = $booking->payments()
@@ -109,6 +94,80 @@ class PaymentService
                 ]);
             }
 
+            $successfulPayments = $booking->payments()
+                ->where('status', 'success')
+                ->get();
+
+            $totalPaid = (int) $successfulPayments->sum('amount');
+            $remainingAmount = $total - $totalPaid;
+
+            if ($remainingAmount <= 0) {
+                throw ValidationException::withMessages([
+                    'payment' => 'Booking ini sudah lunas.',
+                ]);
+            }
+
+            if ($type === 'dp') {
+                $expectedDp = intdiv(($total * 30) + 99, 100);
+
+                if (
+                    $booking->status !== 'pending_payment'
+                    || $booking->payment_status !== 'unpaid'
+                    || $totalPaid !== 0
+                ) {
+                    throw ValidationException::withMessages([
+                        'payment' => 'DP hanya dapat dibuat untuk booking yang belum dibayar.',
+                    ]);
+                }
+
+                if ($amount !== $expectedDp) {
+                    throw new InvalidArgumentException(
+                        'Nominal DP harus tepat 30% dari total booking.'
+                    );
+                }
+            }
+
+            if ($type === 'full_payment') {
+                if (
+                    $booking->status !== 'pending_payment'
+                    || $booking->payment_status !== 'unpaid'
+                    || $totalPaid !== 0
+                ) {
+                    throw ValidationException::withMessages([
+                        'payment' => 'Pembayaran penuh hanya dapat dibuat untuk booking yang belum dibayar.',
+                    ]);
+                }
+
+                if ($amount !== $total) {
+                    throw new InvalidArgumentException(
+                        'Pembayaran penuh harus sama dengan total tagihan.'
+                    );
+                }
+            }
+
+            if ($type === 'remaining_payment') {
+                $hasSuccessfulDp = $successfulPayments->contains(
+                    fn (Payment $payment) =>
+                        $payment->transaction_type === 'dp'
+                );
+
+                if (
+                    $booking->status !== 'confirmed'
+                    || $booking->payment_status !== 'partially_paid'
+                    || !$hasSuccessfulDp
+                ) {
+                    throw ValidationException::withMessages([
+                        'payment' => 'Pelunasan hanya dapat dilakukan setelah DP berhasil dan booking dikonfirmasi.',
+                    ]);
+                }
+
+                if ($amount !== $remainingAmount) {
+                    throw new InvalidArgumentException(
+                        'Nominal pelunasan harus sama dengan sisa tagihan.'
+                    );
+                }
+            }
+
             return $booking->payments()->create([
                 'transaction_type' => $type,
                 'payment_method' => $method,
@@ -119,11 +178,11 @@ class PaymentService
     }
 
     /**
-     * Konfirmasi pembayaran yang SUDAH diverifikasi
+     * Mengonfirmasi pembayaran yang sudah diverifikasi
      * oleh gateway atau proses admin tepercaya.
      *
-     * Jangan panggil metode ini langsung dari endpoint publik
-     * tanpa verifikasi autentikasi/signature dan sumber transaksi.
+     * Endpoint publik wajib memverifikasi signature webhook
+     * dan identitas transaksi sebelum memanggil metode ini.
      */
     public function confirmVerifiedPayment(
         int $paymentId,
@@ -143,24 +202,36 @@ class PaymentService
             $externalTransactionId,
             $gatewayResponse
         ) {
+            // Ambil booking_id terlebih dahulu tanpa mengunci payment.
+            $paymentReference = Payment::query()
+                ->select(['id', 'booking_id'])
+                ->whereKey($paymentId)
+                ->firstOrFail();
+
+            // Urutan lock konsisten: Booking dahulu, lalu Payment.
+            $booking = Booking::query()
+                ->whereKey($paymentReference->booking_id)
+                ->lockForUpdate()
+                ->firstOrFail();
+
             $payment = Payment::query()
                 ->whereKey($paymentId)
                 ->lockForUpdate()
                 ->firstOrFail();
 
-            $booking = Booking::query()
-                ->whereKey($payment->booking_id)
-                ->lockForUpdate()
-                ->firstOrFail();
+            if ((int) $payment->booking_id !== (int) $booking->id) {
+                throw ValidationException::withMessages([
+                    'payment' => 'Referensi booking transaksi tidak valid.',
+                ]);
+            }
 
-            // Nominal harus cocok dengan transaksi yang dibuat.
             if ((int) $payment->amount !== $verifiedAmount) {
                 throw ValidationException::withMessages([
                     'payment' => 'Nominal terverifikasi tidak cocok dengan transaksi.',
                 ]);
             }
 
-            // Jika callback dikirim ulang, jangan memproses pembayaran lagi.
+            // Callback berulang tidak boleh memproses transaksi lagi.
             if ($payment->status === 'success') {
                 if (
                     $externalTransactionId !== null
@@ -181,22 +252,77 @@ class PaymentService
                 ]);
             }
 
-            // Cegah dua pembayaran sukses untuk booking yang sama.
-            $anotherSuccessfulPayment = $booking->payments()
-                ->where('id', '!=', $payment->id)
-                ->where('status', 'success')
-                ->exists();
+            // Cegah penggunaan ID transaksi eksternal yang sama.
+            if ($externalTransactionId !== null) {
+                $duplicateExternalId = Payment::query()
+                    ->where('external_transaction_id', $externalTransactionId)
+                    ->where('id', '!=', $payment->id)
+                    ->exists();
 
-            if ($anotherSuccessfulPayment) {
+                if ($duplicateExternalId) {
+                    throw ValidationException::withMessages([
+                        'payment' => 'ID transaksi eksternal sudah digunakan.',
+                    ]);
+                }
+            }
+
+            $total = (int) $booking->total_amount;
+
+            $successfulPayments = $booking->payments()
+                ->where('status', 'success')
+                ->get();
+
+            $totalPaid = (int) $successfulPayments->sum('amount');
+            $remainingAmount = $total - $totalPaid;
+
+            if ($payment->transaction_type === 'dp') {
+                $expectedDp = intdiv(($total * 30) + 99, 100);
+
+                if (
+                    $booking->payment_status !== 'unpaid'
+                    || $booking->status !== 'pending_payment'
+                    || $totalPaid !== 0
+                    || (int) $payment->amount !== $expectedDp
+                ) {
+                    throw ValidationException::withMessages([
+                        'payment' => 'Transaksi DP tidak sesuai dengan kondisi booking.',
+                    ]);
+                }
+            } elseif ($payment->transaction_type === 'full_payment') {
+                if (
+                    $booking->payment_status !== 'unpaid'
+                    || $booking->status !== 'pending_payment'
+                    || $totalPaid !== 0
+                    || (int) $payment->amount !== $total
+                ) {
+                    throw ValidationException::withMessages([
+                        'payment' => 'Transaksi pembayaran penuh tidak sesuai dengan kondisi booking.',
+                    ]);
+                }
+            } elseif ($payment->transaction_type === 'remaining_payment') {
+                $hasSuccessfulDp = $successfulPayments->contains(
+                    fn (Payment $item) =>
+                        $item->transaction_type === 'dp'
+                );
+
+                if (
+                    $booking->status !== 'confirmed'
+                    || $booking->payment_status !== 'partially_paid'
+                    || !$hasSuccessfulDp
+                    || (int) $payment->amount !== $remainingAmount
+                ) {
+                    throw ValidationException::withMessages([
+                        'payment' => 'Transaksi pelunasan tidak sesuai dengan sisa tagihan.',
+                    ]);
+                }
+            } else {
                 throw ValidationException::withMessages([
-                    'payment' => 'Booking ini sudah memiliki pembayaran berhasil. Perlu pemeriksaan manual.',
+                    'payment' => 'Jenis transaksi ini belum didukung oleh proses konfirmasi.',
                 ]);
             }
 
-            $now = now();
-
             $payment->status = 'success';
-            $payment->paid_at = $now;
+            $payment->paid_at = now();
 
             if ($externalTransactionId !== null) {
                 $payment->external_transaction_id = $externalTransactionId;
@@ -207,20 +333,20 @@ class PaymentService
 
             if ($payment->transaction_type === 'dp') {
                 $booking->payment_status = 'partially_paid';
-            } elseif ($payment->transaction_type === 'full_payment') {
+            } else {
                 $booking->payment_status = 'paid';
             }
 
-            // Booking hanya otomatis dikonfirmasi jika pembayaran penuh
-            // terverifikasi dan masa hold masih berlaku.
-            // Pembayaran setelah hold berakhir perlu penanganan manual.
-            $holdIsActive = $booking->hold_expires_at !== null
-                && $booking->hold_expires_at->isFuture();
-
+            // DP maupun pembayaran penuh mengonfirmasi booking
+            // hanya selama masa hold masih aktif.
             if (
-                $payment->transaction_type === 'full_payment'
+                in_array($payment->transaction_type, [
+                    'dp',
+                    'full_payment',
+                ], true)
                 && $booking->status === 'pending_payment'
-                && $holdIsActive
+                && $booking->hold_expires_at !== null
+                && $booking->hold_expires_at->isFuture()
             ) {
                 $previousStatus = $booking->status;
                 $booking->status = 'confirmed';
@@ -231,9 +357,13 @@ class PaymentService
                     'from_status' => $previousStatus,
                     'to_status' => 'confirmed',
                     'changed_by' => null,
-                    'notes' => 'Booking dikonfirmasi setelah pembayaran penuh terverifikasi.',
+                    'notes' => $payment->transaction_type === 'dp'
+                        ? 'Booking dikonfirmasi setelah pembayaran DP 30% terverifikasi.'
+                        : 'Booking dikonfirmasi setelah pembayaran penuh terverifikasi.',
                 ]);
             } else {
+                // Pembayaran yang masuk setelah hold berakhir
+                // dicatat, tetapi booking tidak diaktifkan kembali.
                 $booking->save();
             }
 
